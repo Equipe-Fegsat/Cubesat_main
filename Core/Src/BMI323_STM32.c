@@ -7,7 +7,7 @@
   * LSB primeiro), e toda LEITURA insere 2 bytes "dummy" (sempre 0x00) antes
   * do dado real. No modo SPI, o quadro de leitura fica:
   *     [endereco | 0x80]  [dummy]  [dummy]  [dado0] [dado1] ...
-  * Ou seja, para ler N bytes de dado real, e preciso clocar 1 (endereco) +
+  * Ou seja, para ler N bytes de dado real, e git preciso clocar 1 (endereco) +
   * 2 (dummy) + N bytes, com CS mantido em nivel baixo durante toda a
   * transacao. Escritas NAO tem dummy: [endereco] [dado0] [dado1] ...
   *
