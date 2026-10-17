@@ -20,7 +20,7 @@ O firmware roda em um microcontrolador **STM32H743VIT6**, lê sensores de press�
 
 | Componente | Grandeza medida | Interface |
 |---|---|---|
-| **STM32H743VIT6** (LQFP100, placa própria) | Microcontrolador principal | – |
+| **STM32H743VIT6** (placa WeAct) | Microcontrolador principal | – |
 | **MS5611** | Pressão e temperatura | I2C4 |
 | **BME68X** (família BME680/688) | Temperatura, pressão, umidade e resistência de gás | I2C4 |
 | **BMI323** (módulo GY-601) | Acelerômetro e giroscópio (3 eixos) + temperatura | SPI [confirmar: SPI2 ou SPI3] |
