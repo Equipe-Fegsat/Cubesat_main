@@ -8,14 +8,17 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "BMI323_STM32.h"
 #include "ms5611.h"
 #include "bme68x_app.h"
+#include "model.h"
 #include <string.h>
 #include <stdio.h>
+#include "logger.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -25,7 +28,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define IMU_PERIOD_US     10000u   /* 100 Hz: taxa de UpdateIMU                */
+#define BARO_PERIOD_MS    50u      /* 20 Hz: taxa de UpdateBaro                */
+#define TELEM_PERIOD_MS   200u     /* 5 Hz: telemetria pela UART               */
+#define BME_PERIOD_MS     1000u    /* 1 Hz: BME68X (so fora de voo)            */
+#define CAL_SAMPLES       300u     /* amostras de calibracao (~3 s parado)     */
+#define CAL_MAX_TRIES     5u
+#define LIVE_ROTACAO      1        /*<------------------------------------------------------------ Mudar para 0 no lancamento-------------------------------*/
+#define LIVE_PERIOD_MS    40u     /* 25 Hz */
 
+/* Descomente para testar na bancada: baixa o limiar de decolagem para 1.3 g,
+   assim uma "sacudida" da placa dispara a fase BOOST. */
+#define PB_BENCH_TEST 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -38,15 +52,28 @@ ADC_HandleTypeDef hadc1;
 
 I2C_HandleTypeDef hi2c4;
 
+SD_HandleTypeDef hsd1;
+
 SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart4;
 
 /* USER CODE BEGIN PV */
-float temperature_ms5611, pressure_ms5611;
+float temperature_ms5611, pressure_ms5611;   /* pressure_ms5611 em Pa */
 BMI323_Data imu_data;
 BME68X_Data bme68x_data;
 uint32_t led_last_toggle = 0;
+ 
+Peabiru_t peabiru;
+static Peabiru_Phase last_phase = PB_PHASE_PAD;
+static const char *phase_name[] = { "PAD", "BOOST", "COAST", "DESCENT", "LANDED" };
+ 
+static uint32_t imu_period_cyc;   /* periodo do IMU em ciclos do DWT */
+static uint32_t last_imu_cyc;
+static uint32_t last_baro_ms;
+static uint32_t last_telem_ms;
+static uint32_t last_bme_ms;
+static uint32_t last_live_ms;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,8 +84,11 @@ static void MX_ADC1_Init(void);
 static void MX_I2C4_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_UART4_Init(void);
+static void MX_SDMMC1_SD_Init(void);
 /* USER CODE BEGIN PFP */
 void I2C_Scanner(I2C_HandleTypeDef *hi2c);
+static void    DWT_Init(void);
+static uint8_t Peabiru_SetupAndCalibrate(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -89,6 +119,51 @@ void I2C_Scanner(I2C_HandleTypeDef *hi2c)
 
     sprintf(buffer, "--- Fim do scan (%d encontrado(s)) ---\r\n\r\n", found);
     HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+}
+/* Contador de ciclos da CPU: da um dt com resolucao de nanossegundos,
+   bem melhor que o HAL_GetTick() de 1 ms para integrar aceleracao. */
+static void DWT_Init(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->LAR = 0xC5ACCE55;               /* destrava o DWT no Cortex-M7 */
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+ 
+/* Inicializa o modelo e calibra com o Peabiru PARADO. Retorna 1 se deu certo. */
+static uint8_t Peabiru_SetupAndCalibrate(void)
+{
+    Peabiru_Init(&peabiru);              /* zera tudo, inclusive acumuladores */
+ 
+    /* Opcional: gravidade local (padrao 9.786 = Iacanga-SP) */
+    /* Peabiru_SetLocalGravity(&peabiru, 9.78f); */
+ 
+#ifdef PB_BENCH_TEST
+    peabiru.boost_thresh_g = 1.4f;
+#endif
+ 
+    uint32_t n = 0;
+    while (n < CAL_SAMPLES)
+    {
+        /* O barometro e lento: le a cada 10 amostras e reaproveita o valor */
+        if ((n % 10u) == 0u)
+        {
+            MS5611_Measure(&hi2c4, &temperature_ms5611, &pressure_ms5611);
+            if (pressure_ms5611 < 30000.0f) return 0;   /* leitura invalida */
+        }
+ 
+        if (BMI323_ReadData(&imu_data) == 0)
+        {
+            Peabiru_CalibAddSample(&peabiru,
+                                   imu_data.accel_x_g, imu_data.accel_y_g, imu_data.accel_z_g,
+                                   imu_data.gyro_x_dps, imu_data.gyro_y_dps, imu_data.gyro_z_dps,
+                                   pressure_ms5611);
+            n++;
+        }
+        HAL_Delay(10);
+    }
+ 
+    return Peabiru_CalibFinish(&peabiru);
 }
 /* USER CODE END 0 */
 
@@ -128,8 +203,10 @@ int main(void)
   MX_I2C4_Init();
   MX_SPI2_Init();
   MX_UART4_Init();
+  MX_SDMMC1_SD_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
-  char buffer[128];
+  char buffer[256];
 
   /* Scan de dispositivos I2C no barramento 4 */
   I2C_Scanner(&hi2c4);
@@ -153,6 +230,57 @@ int main(void)
   sprintf(buffer, "BMI323 CHIP_ID lido: 0x%02X (esperado: 0x43)\r\n", g_bmi323_debug_chip_id);
   HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
 
+   /* ------------------------------ MODELO -------------------------------- */
+  DWT_Init();
+  HAL_Delay(1000);   /* deixa o sensor assentar antes de calibrar */
+ 
+  sprintf(buffer, "Calibrando o modelo: mantenha o Peabiru PARADO...\r\n");
+  HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+ 
+  uint8_t cal_ok = 0;
+  for (uint32_t tentativa = 1; tentativa <= CAL_MAX_TRIES && !cal_ok; tentativa++)
+  {
+      cal_ok = Peabiru_SetupAndCalibrate();
+      if (!cal_ok)
+      {
+          sprintf(buffer, "Calibracao falhou (tentativa %lu/%u)\r\n",
+                  (unsigned long)tentativa, (unsigned)CAL_MAX_TRIES);
+          HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+          HAL_Delay(500);
+      }
+  }
+ 
+  if (cal_ok)
+  {
+      sprintf(buffer, "Modelo calibrado. p0=%.2f hPa | escala acel=%.4f | giro bias(rad/s)=%.4f %.4f %.4f\r\n",
+              peabiru.p0_pa / 100.0f, peabiru.accel_scale,
+              peabiru.gbx, peabiru.gby, peabiru.gbz);
+  }
+  else
+  {
+      sprintf(buffer, "ERRO: modelo NAO calibrado (UpdateIMU/UpdateBaro serao ignorados)\r\n");
+  }
+  HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+ 
+  /* Temporizacao do loop principal */
+  imu_period_cyc = (SystemCoreClock / 1000000u) * IMU_PERIOD_US;
+  last_imu_cyc   = DWT->CYCCNT;
+  last_baro_ms   = HAL_GetTick();
+  last_telem_ms  = last_baro_ms;
+  last_bme_ms    = last_baro_ms;
+
+  /* ------------------------------ Logger -------------------------------- */
+  if (Logger_Init())
+  {
+    snprintf(buffer, sizeof(buffer), "SD ok: gravando em %s\r\n", Logger_FileName());
+    Logger_Print("t_ms,fase,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,press_pa,alt_m,vel_ms,acc_g,tilt_deg,x_m,y_m,vx_ms,vy_ms,roll_deg,pitch_deg,yaw_deg,acc_up_ms2,flight_time_s\n");
+  }
+  else
+  {
+    snprintf(buffer, sizeof(buffer), "ERRO: cartao SD nao montou\r\n");
+  }
+HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -162,42 +290,117 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /*-----------------------------LED---------------------*/
+      /*----------------------------- LED ----------------------------------*/
     if (HAL_GetTick() - led_last_toggle >= 1000)
     {
       HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_3);
       led_last_toggle = HAL_GetTick();
     }
-
-    /* ---------------- Leitura do BME68X ---------------- */
-    if (BME68X_App_ReadData(&bme68x_data)) 
+ 
+    /*------------------- IMU a taxa fixa (100 Hz) -----------------------*/
+    uint32_t now_cyc = DWT->CYCCNT;
+    if ((uint32_t)(now_cyc - last_imu_cyc) >= imu_period_cyc)
     {
-      sprintf(buffer, "BME68X  -> Temp: %.2fC | Press: %.2fhPa | Hum: %.2f%% | Gas: %.0f Ohm\r\n",
-              bme68x_data.temperature, bme68x_data.pressure, 
-              bme68x_data.humidity, bme68x_data.gas_resistance);
-      HAL_UART_Transmit(&huart4, (uint8_t*)buffer, strlen(buffer), 100);
+        /* dt REAL medido pelo DWT (a diferenca em uint32 ja trata o overflow) */
+        float dt = (float)(uint32_t)(now_cyc - last_imu_cyc) / (float)SystemCoreClock;
+        last_imu_cyc = now_cyc;
+ 
+          if (BMI323_ReadData(&imu_data) == 0)
+        {
+            Peabiru_UpdateIMU(&peabiru,
+                              imu_data.accel_x_g, imu_data.accel_y_g, imu_data.accel_z_g,
+                              imu_data.gyro_x_dps, imu_data.gyro_y_dps, imu_data.gyro_z_dps,
+                              dt);
+ 
+            /* <<< ADICIONAR: uma linha de log por amostra do IMU >>> */
+            Logger_Print("%lu,%d,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,"
+             "%.1f,%.3f,%.3f,%.3f,%.2f,"
+             "%.3f,%.3f,%.3f,%.3f,"
+             "%.2f,%.2f,%.2f,%.3f,%.3f\n",
+             (unsigned long)HAL_GetTick(),
+             (int)peabiru.phase,
+             imu_data.accel_x_g,
+             imu_data.accel_y_g,
+             imu_data.accel_z_g,
+             imu_data.gyro_x_dps,
+             imu_data.gyro_y_dps,
+             imu_data.gyro_z_dps,
+             pressure_ms5611,
+             peabiru.alt_m,
+             peabiru.vel_up_ms,
+             peabiru.acc_mag_g,
+             peabiru.tilt_deg,
+             peabiru.x_m,
+             peabiru.y_m,
+             peabiru.vx_ms,
+             peabiru.vy_ms,
+             peabiru.roll_deg,
+             peabiru.pitch_deg,
+             peabiru.yaw_deg,
+             peabiru.acc_up_ms2,
+             peabiru.flight_time_s);
+        }
+    }
+    /*------------------- Mudança Maquina de Estados -----------------------*/
+    if (peabiru.phase != last_phase)
+    {
+    snprintf(buffer, sizeof(buffer),
+             ">>> FASE: %s -> %s | t=%.2fs |a|=%.2fg vel=%.2fm/s alt=%.2fm\r\n",
+             phase_name[last_phase], phase_name[peabiru.phase],
+             peabiru.flight_time_s, peabiru.acc_mag_g,
+             peabiru.vel_up_ms, peabiru.alt_m);
+    HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+    last_phase = peabiru.phase;
     }
 
-    /* ---------------- Leitura do MS5611 ---------------- */
-    MS5611_Measure(&hi2c4, &temperature_ms5611, &pressure_ms5611);
-    sprintf(buffer, "MS5611  -> Temp: %.2f C | Press: %.2f hPa\r\n", 
-            temperature_ms5611, pressure_ms5611 / 100.0f);
-    HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
-
-    /* ---------------- Leitura do BMI323 ---------------- */
-    if (BMI323_ReadData(&imu_data) == 0)
+    /*------------------- Barometro (20 Hz) ------------------------------*/
+    if (HAL_GetTick() - last_baro_ms >= BARO_PERIOD_MS)
     {
-      sprintf(buffer, "BMI323  -> Accel[g]: X=%.3f Y=%.3f Z=%.3f | Gyro[dps]: X=%.2f Y=%.2f Z=%.2f | Temp=%.1fC\r\n",
-              imu_data.accel_x_g, imu_data.accel_y_g, imu_data.accel_z_g,
-              imu_data.gyro_x_dps, imu_data.gyro_y_dps, imu_data.gyro_z_dps,
-              imu_data.temp_c);
-      HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+        last_baro_ms = HAL_GetTick();
+        MS5611_Measure(&hi2c4, &temperature_ms5611, &pressure_ms5611);   /* Pa */
+        Peabiru_UpdateBaro(&peabiru, pressure_ms5611);
+    }
+ 
+    /*------------------- BME68X (so fora de voo) ------------------------*/
+    if ((peabiru.phase == PB_PHASE_PAD || peabiru.phase == PB_PHASE_LANDED) &&
+        (HAL_GetTick() - last_bme_ms >= BME_PERIOD_MS))
+    {
+        last_bme_ms = HAL_GetTick();
+        if (BME68X_App_ReadData(&bme68x_data))
+        {
+            sprintf(buffer, "BME68X  -> Temp: %.2fC | Press: %.2fhPa | Hum: %.2f%% | Gas: %.0f Ohm\r\n",
+                    bme68x_data.temperature, bme68x_data.pressure,
+                    bme68x_data.humidity, bme68x_data.gas_resistance);
+            HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+        }
+    }
+ 
+    /*------------------- Telemetria (5 Hz) ------------------------------*/
+    if (HAL_GetTick() - last_telem_ms >= TELEM_PERIOD_MS)
+    {
+        last_telem_ms = HAL_GetTick();
+        snprintf(buffer, sizeof(buffer),
+                 "[%s] alt=%.2fm vel=%.2fm/s |a|=%.2fg tilt=%.1fdeg x=%.1f y=%.1f max=%.1fm\r\n",
+                 phase_name[peabiru.phase],
+                 peabiru.alt_m, peabiru.vel_up_ms, peabiru.acc_mag_g,
+                 peabiru.tilt_deg, peabiru.x_m, peabiru.y_m, peabiru.max_alt_m);
+        HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
     }
 
-    sprintf(buffer, "------------------------------------------------------------------------------------\r\n");
-    HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
-
-    HAL_Delay(1000);
+    #if LIVE_ROTACAO
+    if (HAL_GetTick() - last_live_ms >= LIVE_PERIOD_MS)
+    {
+        last_live_ms = HAL_GetTick();
+        snprintf(buffer, sizeof(buffer), "R,%lu,%.2f,%.2f,%.2f,%d,%.2f,%.2f\r\n",
+                 (unsigned long)last_live_ms,
+                 peabiru.roll_deg, peabiru.pitch_deg, peabiru.yaw_deg,
+                 (int)peabiru.phase,
+                 peabiru.alt_m, peabiru.vel_up_ms);
+        HAL_UART_Transmit(&huart4, (uint8_t *)buffer, strlen(buffer), 100);
+    }
+#endif
+    Logger_Poll();
+    
   }
   /* USER CODE END 3 */
 }
@@ -379,6 +582,37 @@ static void MX_I2C4_Init(void)
 }
 
 /**
+  * @brief SDMMC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SDMMC1_SD_Init(void)
+{
+
+  /* USER CODE BEGIN SDMMC1_Init 0 */
+
+  /* USER CODE END SDMMC1_Init 0 */
+
+  /* USER CODE BEGIN SDMMC1_Init 1 */
+
+  /* USER CODE END SDMMC1_Init 1 */
+  hsd1.Instance = SDMMC1;
+  hsd1.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
+  hsd1.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
+  hsd1.Init.BusWide = SDMMC_BUS_WIDE_4B;
+  hsd1.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
+  hsd1.Init.ClockDiv = 8;
+  if (HAL_SD_Init(&hsd1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SDMMC1_Init 2 */
+
+  /* USER CODE END SDMMC1_Init 2 */
+
+}
+
+/**
   * @brief SPI2 Initialization Function
   * @param None
   * @retval None
@@ -397,16 +631,16 @@ static void MX_SPI2_Init(void)
   hspi2.Instance = SPI2;
   hspi2.Init.Mode = SPI_MODE_MASTER;
   hspi2.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.DataSize = SPI_DATASIZE_4BIT;
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi2.Init.NSS = SPI_NSS_SOFT;                 /* <-- revertido: CS manual via GPIO (PB12) */
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi2.Init.CRCPolynomial = 0x0;
-  hspi2.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
   hspi2.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
   hspi2.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
   hspi2.Init.TxCRCInitializationPattern = SPI_CRC_INITIALIZATION_ALL_ZERO_PATTERN;
@@ -414,8 +648,8 @@ static void MX_SPI2_Init(void)
   hspi2.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
   hspi2.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
   hspi2.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
-  hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_ENABLE;
-  hspi2.Init.IOSwap = SPI_IO_SWAP_ENABLE;
+  hspi2.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
+  hspi2.Init.IOSwap = SPI_IO_SWAP_DISABLE;
   if (HAL_SPI_Init(&hspi2) != HAL_OK)
   {
     Error_Handler();
@@ -491,11 +725,12 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level (CS do BMI323 em repouso = alto) */
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
 
   /*Configure GPIO pin : PE3 */
@@ -511,19 +746,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PC10 */
-  GPIO_InitStruct.Pin = GPIO_PIN_10;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PB12 (CS do BMI323, controlado manualmente) */
+  /*Configure GPIO pin : PB12 */
   GPIO_InitStruct.Pin = GPIO_PIN_12;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -593,4 +820,4 @@ void assert_failed(uint8_t *file, uint32_t line)
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
-#endif /* USE_FULL_ASSERT */git 
+#endif /* USE_FULL_ASSERT */

@@ -46,6 +46,8 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/main.c
+    Core/Src/model.c
+    Core/Src/logger.c
     Core/Src/stm32h7xx_it.c
     Core/Src/stm32h7xx_hal_msp.c
     Core/Src/syscalls.c
@@ -75,3 +77,4 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
+

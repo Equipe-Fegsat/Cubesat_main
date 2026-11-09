@@ -1,18 +1,9 @@
 /**
   ******************************************************************************
   * @file    BMI323_STM32.h
-  * @brief   Driver para o IMU BMI323 (Bosch) via SPI2 usando HAL STM32.
-  *          O sensor da placa GY-601N1 do projeto e na verdade um BMI323
-  *          (confirmado via CHIP_ID 0x43), cabeado no SPI2 conforme o
-  *          conector Connector_ICM1 do pinout:
-  *            ICM_CS   -> PB12 (GPIO, controlado por software)
-  *            ICM_SCLK -> PB13 (SPI2_SCK)
-  *            ICM_SDI  -> PB14 (SPI2_MISO no MCU)
-  *            ICM_SDO  -> PB15 (SPI2_MOSI no MCU)
-  *          OBS: confira fisicamente se SDI/SDO nao estao trocados em
-  *          relacao ao MISO/MOSI do MCU. Se estiverem, ative
-  *          hspi2.Init.IOSwap = SPI_IO_SWAP_ENABLE na MX_SPI2_Init em vez
-  *          de alterar este driver.
+  * @brief   Driver para o IMU BMI323 (Bosch) via I2C usando HAL STM32.
+  *          Substitui o driver ICM42688 - o sensor da placa GY-601N1 do
+  *          projeto é na verdade um BMI323, confirmado via CHIP_ID (0x43).
   ******************************************************************************
   */
 
@@ -26,9 +17,9 @@ extern "C" {
 #include "main.h"
 
 /* ---------------- Configuração de Hardware ---------------- */
-#define BMI323_SPI_HANDLE      hspi2
-#define BMI323_CS_GPIO_Port    GPIOB
-#define BMI323_CS_Pin          GPIO_PIN_12
+#define BMI323_I2C_HANDLE      hi2c4
+/* Endereco I2C: 0x68 se SA0 = GND, 0x69 se SA0 = VCC (fiacao atual do projeto) */
+#define BMI323_I2C_ADDR        0x69
 
 /* Guarda o ultimo CHIP_ID lido (byte baixo), para debug via UART */
 extern uint8_t g_bmi323_debug_chip_id;
@@ -44,11 +35,10 @@ typedef struct
     float temp_c;
 } BMI323_Data;
 
-/* Inicializa o sensor: dummy read p/ selecionar modo SPI + soft reset +
- * configura accel (+-2g) e giro (+-125dps) a 800Hz em modo alta
- * performance. Retorna 0 em sucesso.
+/* Inicializa o sensor: soft reset + configura accel (+-2g) e giro (+-125dps)
+ * a 800Hz em modo alta performance. Retorna 0 em sucesso.
  * 1 = falha de comunicacao no soft reset
- * 2 = CHIP_ID nao bateu com 0x43 (confira fiacao/CS/SCLK/SDI/SDO)
+ * 2 = CHIP_ID nao bateu com 0x43 (confira endereco/fiacao)
  * 3 = falha ao configurar ACC_CONF
  * 4 = falha ao configurar GYR_CONF
  */
